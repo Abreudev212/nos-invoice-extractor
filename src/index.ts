@@ -12,11 +12,21 @@ const DOCUMENTS = {
     prompt: `Recebes o TEXTO de UMA página de uma fatura NOS, extraído
 diretamente do PDF com o layout preservado. Devolves JSON.
 
-CLASSIFICA a página em tipoPagina:
-- "cabecalho": resumo da conta, totais, dados de pagamento
-- "circuitos": tabela com códigos 5.86350... e códigos VA
-- "movimentos": listagem de mensalidades ou consumos por número
-- "outro"
+CLASSIFICACAO — regra de decisão, por esta ordem:
+
+1. Se o texto contiver pelo menos uma linha no formato
+   5.86350.NN.NN (VAxxx)  ->  tipoPagina = "circuitos"
+   Esta regra tem prioridade absoluta. Todas as páginas têm cabeçalho
+   com número de conta, número de fatura e datas — isso NÃO faz da
+   página um "cabecalho".
+
+2. Senão, se contiver linhas com "Tarifário" e "Descrição"
+   ->  tipoPagina = "movimentos"
+
+3. Senão, se contiver "Resumo da conta" ou "Resumo desta fatura"
+   ->  tipoPagina = "cabecalho"
+
+4. Caso contrário  ->  "outro"
 
 CABEÇALHO DA FATURA
 Extrai apenas se estiver presente no texto, senão null:
@@ -189,9 +199,14 @@ function limparCircuitos(lista) {
 
 function normalizarPagina(dados) {
   const tipos = ["cabecalho", "circuitos", "movimentos", "outro"];
-  const tipoPagina = tipos.includes(dados?.tipoPagina) ? dados.tipoPagina : "outro";
-  const semCircuitos = tipoPagina === "movimentos" || tipoPagina === "outro";
+  let tipoPagina = tipos.includes(dados?.tipoPagina) ? dados.tipoPagina : "outro";
 
+  // Se o modelo devolveu circuitos válidos, a página é de circuitos,
+  // independentemente de como os tenha classificado.
+  const candidatos = limparCircuitos(dados?.circuitos);
+  if (candidatos.length > 0) tipoPagina = "circuitos";
+
+  const semCircuitos = tipoPagina !== "circuitos";
   return {
     tipoPagina,
     numeroFatura: str(dados?.numeroFatura),
