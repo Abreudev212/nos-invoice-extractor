@@ -1,102 +1,512 @@
 /**
- * LLM Chat Application Template
+ * Extração de faturas por camada de texto — Cloudflare Worker
  *
- * A simple chat application using Cloudflare Workers AI.
- * This template demonstrates how to implement an LLM-powered chat interface with
- * streaming responses using Server-Sent Events (SSE).
+ * Endpoints
+ *   GET  /api/health       estado e tipos de documento registados
+ *   POST /api/pdf-text     PDF -> texto por página (sem AI, rápido, diagnóstico)
+ *   POST /api/extract      texto de 1 página -> JSON estruturado
+ *   POST /api/consolidate  array de páginas -> JSON final da fatura
  *
- * @license MIT
+ * Autenticação: header  x-api-key: <FLOW_API_KEY>
+ *
+ * Diferença para a versão de visão: não há OCR. Os caracteres vêm do
+ * ficheiro, por isso não existem dígitos inventados.
  */
-import { Env, ChatMessage } from "./types";
 
-// Model ID for Workers AI model
-// https://developers.cloudflare.com/workers-ai/models/
-const MODEL_ID = "@cf/meta/llama-3.1-8b-instruct-fp8";
+import { extractText, getDocumentProxy } from "unpdf";
 
-// Default system prompt
-const SYSTEM_PROMPT =
-	"You are a helpful, friendly assistant. Provide concise and accurate responses.";
+// =====================================================================
+// REGISTO DE DOCUMENTOS
+// =====================================================================
+
+const DOCUMENTS = {
+  nos_fatura: {
+    match: /nos|circuitos|ft\s*\d{6}/i,
+    model: "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+    // Páginas cujo texto não contenha isto nem sequer vão ao modelo.
+    filtro: /5\.86350\.\d+\.\d+/,
+    prompt: `Recebes o TEXTO de UMA página de uma fatura NOS, extraído
+diretamente do PDF com o layout preservado. Devolves JSON.
+
+CLASSIFICA a página em tipoPagina:
+- "cabecalho": resumo da conta, totais, dados de pagamento
+- "circuitos": tabela com códigos 5.86350... e códigos VA
+- "movimentos": listagem de mensalidades ou consumos por número
+- "outro"
+
+CABEÇALHO DA FATURA
+Extrai apenas se estiver presente no texto, senão null:
+- numeroFatura (ex.: "FT 202613/94278")
+- dataFatura (data de emissão, não o vencimento nem o período)
+- periodoFaturacao (ex.: "01-02-2026 até 28-02-2026")
+- totalFatura (o total SEM IVA, o valor que aparece como "Total: €..."
+  no topo da tabela de circuitos)
+
+TABELA DE CIRCUITOS
+Três tipos de linha:
+
+1. CABEÇALHO DE GRUPO — código curto e um nome, sem VA.
+   5.86350.17 (FORTIGATE)   €13.492,951
+   Ignora por completo.
+
+2. CIRCUITO — código longo e um código VA na mesma linha.
+   5.86350.17.10 (VA001)    €782,570
+   -> { codigo: "5.86350.17.10", va: "VA001", valor: 782.570 }
+
+3. REFERÊNCIA — linha indentada, só com um número e um valor.
+        020045813           €391,280
+   Pertence ao circuito imediatamente ACIMA.
+
+FRONTEIRAS DE PÁGINA
+Se a página começar com referências ANTES do primeiro código VA, essas
+referências vêm da página anterior: coloca-as em "referenciasOrfas".
+Se a página começar logo com um código VA, referenciasOrfas é [].
+
+NÚMEROS
+Notação portuguesa para número JSON:
+  13.492,951 -> 13492.951    782,570 -> 782.570    €0,000 -> 0
+
+REGRAS
+Copia os dígitos EXATAMENTE como estão no texto. Não corrijas, não
+completes, não calcules, não somas, não inventes códigos VA.
+Se tipoPagina for "movimentos" ou "outro", devolve arrays vazios.`,
+  },
+};
+
+// =====================================================================
+// SCHEMA DE SAÍDA DO MODELO
+// =====================================================================
+
+const REFERENCIA_SCHEMA = {
+  type: "object",
+  properties: {
+    referencia: { type: "string" },
+    valor: { anyOf: [{ type: "number" }, { type: "null" }] },
+  },
+  required: ["referencia", "valor"],
+  additionalProperties: false,
+};
+
+const PAGE_SCHEMA = {
+  type: "object",
+  properties: {
+    tipoPagina: {
+      type: "string",
+      enum: ["cabecalho", "circuitos", "movimentos", "outro"],
+    },
+    numeroFatura: { anyOf: [{ type: "string" }, { type: "null" }] },
+    dataFatura: { anyOf: [{ type: "string" }, { type: "null" }] },
+    periodoFaturacao: { anyOf: [{ type: "string" }, { type: "null" }] },
+    totalFatura: { anyOf: [{ type: "number" }, { type: "null" }] },
+    circuitos: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          codigo: { type: "string" },
+          va: { type: "string" },
+          valor: { anyOf: [{ type: "number" }, { type: "null" }] },
+          referencias: { type: "array", items: REFERENCIA_SCHEMA },
+        },
+        required: ["codigo", "va", "valor", "referencias"],
+        additionalProperties: false,
+      },
+    },
+    referenciasOrfas: { type: "array", items: REFERENCIA_SCHEMA },
+  },
+  required: [
+    "tipoPagina",
+    "numeroFatura",
+    "dataFatura",
+    "periodoFaturacao",
+    "totalFatura",
+    "circuitos",
+    "referenciasOrfas",
+  ],
+  additionalProperties: false,
+};
+
+// =====================================================================
+// VALIDAÇÃO
+// =====================================================================
+
+const RE_CODIGO = /^5\.86350(?:\.\d+)+$/;
+const RE_VA = /^VA\d+$/;
+const RE_REFERENCIA = /^\d{6,12}$/;
+
+const num = (v) => (typeof v === "number" && Number.isFinite(v) ? v : null);
+const str = (v) => (typeof v === "string" && v.trim() ? v.trim() : null);
+
+// VA01 e VA001 são o mesmo circuito.
+const normalizarVA = (v) =>
+  String(v ?? "").trim().toUpperCase()
+    .replace(/^VA0*(\d+)$/, (_, n) => "VA" + n.padStart(3, "0"));
+
+function limparReferencias(lista) {
+  const vistas = new Map();
+
+  for (const item of Array.isArray(lista) ? lista : []) {
+    const referencia = String(item?.referencia ?? "").trim();
+    if (!RE_REFERENCIA.test(referencia)) continue;
+
+    const valor = num(item?.valor);
+    const anterior = vistas.get(referencia);
+
+    if (!anterior) vistas.set(referencia, { referencia, valor });
+    else if (anterior.valor === null && valor !== null) anterior.valor = valor;
+  }
+
+  return [...vistas.values()];
+}
+
+function limparCircuitos(lista) {
+  const agrupados = new Map();
+
+  for (const item of Array.isArray(lista) ? lista : []) {
+    const codigo = String(item?.codigo ?? "").trim();
+    const va = normalizarVA(item?.va);
+
+    if (!RE_CODIGO.test(codigo) || !RE_VA.test(va)) continue;
+
+    const chave = `${codigo}|${va}`;
+    const existente = agrupados.get(chave);
+
+    if (!existente) {
+      agrupados.set(chave, {
+        codigo,
+        va,
+        valor: num(item?.valor),
+        referencias: limparReferencias(item?.referencias),
+      });
+      continue;
+    }
+
+    if (existente.valor === null) existente.valor = num(item?.valor);
+    existente.referencias = limparReferencias([
+      ...existente.referencias,
+      ...limparReferencias(item?.referencias),
+    ]);
+  }
+
+  return [...agrupados.values()];
+}
+
+function normalizarPagina(dados) {
+  const tipos = ["cabecalho", "circuitos", "movimentos", "outro"];
+  const tipoPagina = tipos.includes(dados?.tipoPagina) ? dados.tipoPagina : "outro";
+  const semCircuitos = tipoPagina === "movimentos" || tipoPagina === "outro";
+
+  return {
+    tipoPagina,
+    numeroFatura: str(dados?.numeroFatura),
+    dataFatura: str(dados?.dataFatura),
+    periodoFaturacao: str(dados?.periodoFaturacao),
+    totalFatura: num(dados?.totalFatura),
+    circuitos: semCircuitos ? [] : limparCircuitos(dados?.circuitos),
+    referenciasOrfas: semCircuitos ? [] : limparReferencias(dados?.referenciasOrfas),
+  };
+}
+
+// =====================================================================
+// ENTRADA DE FICHEIRO — aceita bytes crus ou base64
+// =====================================================================
+
+function paraBytes(buffer) {
+  const bytes = new Uint8Array(buffer);
+
+  // %PDF- => já são bytes crus
+  const ehPDF =
+    bytes[0] === 0x25 && bytes[1] === 0x50 && bytes[2] === 0x44 && bytes[3] === 0x46;
+
+  if (ehPDF) return bytes;
+
+  // Caso contrário assume base64 em texto (com ou sem prefixo data: e aspas)
+  const texto = new TextDecoder()
+    .decode(bytes)
+    .replace(/^"|"$/g, "")
+    .replace(/^data:[^;]+;base64,/, "")
+    .replace(/\s+/g, "");
+
+  const binario = atob(texto);
+  const saida = new Uint8Array(binario.length);
+  for (let i = 0; i < binario.length; i++) saida[i] = binario.charCodeAt(i);
+
+  return saida;
+}
+
+// =====================================================================
+// UTILITÁRIOS
+// =====================================================================
+
+function resolverDocumento(tipoPedido, nomeFicheiro) {
+  if (tipoPedido && DOCUMENTS[tipoPedido]) {
+    return { tipo: tipoPedido, config: DOCUMENTS[tipoPedido] };
+  }
+  for (const [tipo, config] of Object.entries(DOCUMENTS)) {
+    if (config.match?.test(String(nomeFicheiro || ""))) return { tipo, config };
+  }
+  return null;
+}
+
+function lerRespostaAI(resultado) {
+  let resposta = resultado?.choices?.[0]?.message?.content ?? resultado?.response ?? resultado;
+  if (resposta && typeof resposta === "object") return resposta;
+
+  let texto = String(resposta ?? "").trim()
+    .replace(/^```(?:json)?\s*/i, "")
+    .replace(/\s*```$/i, "");
+
+  const inicio = texto.indexOf("{");
+  const fim = texto.lastIndexOf("}");
+  if (inicio >= 0 && fim > inicio) texto = texto.slice(inicio, fim + 1);
+
+  return JSON.parse(texto);
+}
+
+const json = (corpo, status = 200) => Response.json(corpo, { status });
+
+// =====================================================================
+// CONSOLIDAÇÃO
+// =====================================================================
+
+function consolidar(paginas) {
+  const ordenadas = [...paginas].sort((a, b) => (a.pageNumber ?? 0) - (b.pageNumber ?? 0));
+
+  const circuitos = [];
+  const indice = new Map();
+  const cabecalho = {
+    numeroFatura: null,
+    dataFatura: null,
+    periodoFaturacao: null,
+    totalFatura: null,
+  };
+
+  for (const pagina of ordenadas) {
+    const dados = pagina?.data ?? pagina;
+
+    for (const campo of Object.keys(cabecalho)) {
+      if (cabecalho[campo] === null && dados?.[campo] != null) {
+        cabecalho[campo] = dados[campo];
+      }
+    }
+
+    const orfas = limparReferencias(dados?.referenciasOrfas);
+    if (orfas.length && circuitos.length) {
+      const ultimo = circuitos[circuitos.length - 1];
+      ultimo.referencias = limparReferencias([...ultimo.referencias, ...orfas]);
+    }
+
+    for (const circuito of limparCircuitos(dados?.circuitos)) {
+      const chave = `${circuito.codigo}|${circuito.va}`;
+      const existente = indice.get(chave);
+
+      if (!existente) {
+        indice.set(chave, circuito);
+        circuitos.push(circuito);
+        continue;
+      }
+
+      if (existente.valor === null) existente.valor = circuito.valor;
+      existente.referencias = limparReferencias([
+        ...existente.referencias,
+        ...circuito.referencias,
+      ]);
+    }
+  }
+
+  // O total das páginas de circuitos é o valor SEM IVA — é com esse que a soma bate.
+  const totalSemIVA = ordenadas
+    .map((p) => p?.data ?? p)
+    .find((d) => d?.tipoPagina === "circuitos" && d?.totalFatura != null)?.totalFatura;
+
+  if (totalSemIVA != null) cabecalho.totalFatura = totalSemIVA;
+
+  const saida = circuitos.map((c) => ({
+    codigo: c.codigo,
+    va: c.va,
+    conta: null,
+    descricao: null,
+    valor: c.valor,
+    linhasAssociadas: c.referencias.map((r) => ({
+      referencia: r.referencia,
+      descricao: null,
+      valor: r.valor,
+    })),
+  }));
+
+  const arredondar = (n) => Math.round(n * 1000) / 1000;
+  const somaCircuitos = arredondar(saida.reduce((t, c) => t + (c.valor ?? 0), 0));
+
+  const divergencias = saida
+    .filter((c) => c.valor !== null && c.linhasAssociadas.length > 0)
+    .map((c) => ({
+      va: c.va,
+      valor: c.valor,
+      somaLinhas: arredondar(c.linhasAssociadas.reduce((t, l) => t + (l.valor ?? 0), 0)),
+    }))
+    .filter((c) => Math.abs(c.valor - c.somaLinhas) > 0.005);
+
+  return {
+    numeroFatura: cabecalho.numeroFatura,
+    dataFatura: cabecalho.dataFatura,
+    periodoFaturacao: cabecalho.periodoFaturacao,
+    circuitos: saida,
+    validacao: {
+      paginasRecebidas: ordenadas.length,
+      totalCircuitos: saida.length,
+      totalFaturaLido: cabecalho.totalFatura,
+      somaCircuitos,
+      diferenca:
+        cabecalho.totalFatura === null
+          ? null
+          : arredondar(somaCircuitos - cabecalho.totalFatura),
+      circuitosSemValor: saida.filter((c) => c.valor === null).map((c) => c.va),
+      circuitosComSomaDivergente: divergencias,
+      fiavel:
+        cabecalho.totalFatura !== null &&
+        Math.abs(somaCircuitos - cabecalho.totalFatura) <= 0.01 &&
+        divergencias.length === 0,
+    },
+  };
+}
+
+// =====================================================================
+// WORKER
+// =====================================================================
 
 export default {
-	/**
-	 * Main request handler for the Worker
-	 */
-	async fetch(
-		request: Request,
-		env: Env,
-		ctx: ExecutionContext,
-	): Promise<Response> {
-		const url = new URL(request.url);
+  async fetch(request, env) {
+    const url = new URL(request.url);
 
-		// Handle static assets (frontend)
-		if (url.pathname === "/" || !url.pathname.startsWith("/api/")) {
-			return env.ASSETS.fetch(request);
-		}
+    if (request.method === "GET" && url.pathname === "/api/health") {
+      return json({ status: "ok", modo: "texto", documentos: Object.keys(DOCUMENTS) });
+    }
 
-		// API Routes
-		if (url.pathname === "/api/chat") {
-			// Handle POST requests for chat
-			if (request.method === "POST") {
-				return handleChatRequest(request, env);
-			}
+    if (request.method !== "POST") return json({ error: "Method not allowed" }, 405);
+    if (request.headers.get("x-api-key") !== env.FLOW_API_KEY) {
+      return json({ error: "Unauthorized" }, 401);
+    }
 
-			// Method not allowed for other request types
-			return new Response("Method not allowed", { status: 405 });
-		}
+    try {
+      // -------------------------------------------------------------
+      // /api/pdf-text  — PDF inteiro -> texto por página, sem AI
+      // -------------------------------------------------------------
+      if (url.pathname === "/api/pdf-text") {
+        const nomeFicheiro = request.headers.get("x-file-name") || "fatura.pdf";
+        const documento = resolverDocumento(request.headers.get("x-document-type"), nomeFicheiro);
+        const filtro = documento?.config?.filtro ?? null;
 
-		// Handle 404 for unmatched routes
-		return new Response("Not found", { status: 404 });
-	},
-} satisfies ExportedHandler<Env>;
+        const bytes = paraBytes(await request.arrayBuffer());
+        if (!bytes.byteLength) return json({ success: false, error: "PDF vazio." }, 400);
 
-/**
- * Handles chat API requests
- */
-async function handleChatRequest(
-	request: Request,
-	env: Env,
-): Promise<Response> {
-	try {
-		// Parse JSON request body
-		const { messages = [] } = (await request.json()) as {
-			messages: ChatMessage[];
-		};
+        const pdf = await getDocumentProxy(bytes);
+        const { text } = await extractText(pdf, { mergePages: false });
 
-		// Add system prompt if not present
-		if (!messages.some((msg) => msg.role === "system")) {
-			messages.unshift({ role: "system", content: SYSTEM_PROMPT });
-		}
+        const paginas = text.map((texto, i) => ({
+          pageNumber: i + 1,
+          caracteres: texto.length,
+          temCircuitos: filtro ? filtro.test(texto) : true,
+          texto,
+        }));
 
-		const inputs = {
-			messages,
-			max_tokens: 1024,
-			stream: true,
-		} satisfies AiTextGenerationInput & { stream: true };
+        const totalCaracteres = paginas.reduce((t, p) => t + p.caracteres, 0);
 
-		const stream = await env.AI.run<typeof MODEL_ID>(MODEL_ID, inputs, {
-			// Uncomment to use AI Gateway
-			// gateway: {
-			//   id: "YOUR_GATEWAY_ID", // Replace with your AI Gateway ID
-			//   skipCache: false,      // Set to true to bypass cache
-			//   cacheTtl: 3600,        // Cache time-to-live in seconds
-			// },
-		});
+        return json({
+          success: true,
+          documentType: documento?.tipo ?? null,
+          totalPaginas: paginas.length,
+          totalCaracteres,
+          // Se isto for false, o PDF é digitalizado e não tem camada de texto.
+          temCamadaTexto: totalCaracteres > 100,
+          paginasComCircuitos: paginas.filter((p) => p.temCircuitos).map((p) => p.pageNumber),
+          paginas,
+        });
+      }
 
-		return new Response(stream, {
-			headers: {
-				"content-type": "text/event-stream; charset=utf-8",
-				"cache-control": "no-cache",
-				connection: "keep-alive",
-			},
-		});
-	} catch (error) {
-		console.error("Error processing chat request:", error);
-		return new Response(
-			JSON.stringify({ error: "Failed to process request" }),
-			{
-				status: 500,
-				headers: { "content-type": "application/json" },
-			},
-		);
-	}
-}
+      // -------------------------------------------------------------
+      // /api/consolidate
+      // -------------------------------------------------------------
+      if (url.pathname === "/api/consolidate") {
+        const corpo = await request.json();
+        const paginas = Array.isArray(corpo) ? corpo : corpo?.paginas;
+
+        if (!Array.isArray(paginas)) {
+          return json({ success: false, error: "Esperado um array de páginas." }, 400);
+        }
+
+        return json({ success: true, ...consolidar(paginas) });
+      }
+
+      // -------------------------------------------------------------
+      // /api/extract  — texto de 1 página -> JSON
+      // -------------------------------------------------------------
+      if (url.pathname !== "/api/extract") {
+        return json({ error: "Not found", path: url.pathname }, 404);
+      }
+
+      const corpo = await request.json();
+      const texto = String(corpo?.texto ?? "");
+      const pageNumber = Number(corpo?.pageNumber) || null;
+
+      if (!texto.trim()) {
+        return json({ success: false, pageNumber, error: "Texto vazio." }, 400);
+      }
+
+      const documento = resolverDocumento(
+        corpo?.documentType ?? request.headers.get("x-document-type"),
+        corpo?.fileName
+      );
+
+      if (!documento) {
+        return json(
+          { success: false, error: "Tipo de documento não reconhecido.", disponiveis: Object.keys(DOCUMENTS) },
+          400
+        );
+      }
+
+      const modelo = request.headers.get("x-model") || documento.config.model;
+
+      const resultado = await env.AI.run(modelo, {
+        messages: [
+          { role: "system", content: documento.config.prompt },
+          { role: "user", content: `TEXTO DA PÁGINA:\n\n${texto}` },
+        ],
+        temperature: 0,
+        max_tokens: 6000,
+        response_format: { type: "json_schema", json_schema: PAGE_SCHEMA },
+      });
+
+      let bruto;
+      try {
+        bruto = lerRespostaAI(resultado);
+      } catch (erro) {
+        return json(
+          {
+            success: false,
+            stage: "parse_json",
+            pageNumber,
+            error: erro?.message ?? String(erro),
+            rawResponse: resultado?.choices?.[0]?.message?.content ?? resultado?.response ?? null,
+          },
+          502
+        );
+      }
+
+      const data = normalizarPagina(bruto);
+
+      return json({
+        success: true,
+        documentType: documento.tipo,
+        model: modelo,
+        pageNumber,
+        tipoPagina: data.tipoPagina,
+        totalCircuitos: data.circuitos.length,
+        usage: resultado?.usage ?? null,
+        data,
+      });
+    } catch (erro) {
+      console.error("Erro:", erro);
+      return json({ success: false, stage: "worker", error: erro?.message ?? String(erro) }, 500);
+    }
+  },
+};
