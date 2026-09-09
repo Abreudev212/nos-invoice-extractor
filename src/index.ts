@@ -1,18 +1,3 @@
-/**
- * Extração de faturas por camada de texto — Cloudflare Worker
- *
- * Endpoints
- *   GET  /api/health       estado e tipos de documento registados
- *   POST /api/pdf-text     PDF -> texto por página (sem AI, rápido, diagnóstico)
- *   POST /api/extract      texto de 1 página -> JSON estruturado
- *   POST /api/consolidate  array de páginas -> JSON final da fatura
- *
- * Autenticação: header  x-api-key: <FLOW_API_KEY>
- *
- * Diferença para a versão de visão: não há OCR. Os caracteres vêm do
- * ficheiro, por isso não existem dígitos inventados.
- */
-
 import { extractText, getDocumentProxy } from "unpdf";
 
 // =====================================================================
@@ -23,7 +8,6 @@ const DOCUMENTS = {
   nos_fatura: {
     match: /nos|circuitos|ft\s*\d{6}/i,
     model: "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
-    // Páginas cujo texto não contenha isto nem sequer vão ao modelo.
     filtro: /5\.86350\.\d+\.\d+/,
     prompt: `Recebes o TEXTO de UMA página de uma fatura NOS, extraído
 diretamente do PDF com o layout preservado. Devolves JSON.
@@ -45,26 +29,26 @@ Extrai apenas se estiver presente no texto, senão null:
 TABELA DE CIRCUITOS
 Três tipos de linha:
 
-1. CABEÇALHO DE GRUPO — código curto e um nome, sem VA.
-   5.86350.17 (FORTIGATE)   €13.492,951
+1. CABEÇALHO DE GRUPO - código curto e um nome, sem VA.
+   5.86350.17 (FORTIGATE)   13.492,951
    Ignora por completo.
 
-2. CIRCUITO — código longo e um código VA na mesma linha.
-   5.86350.17.10 (VA001)    €782,570
+2. CIRCUITO - código longo e um código VA na mesma linha.
+   5.86350.17.10 (VA001)    782,570
    -> { codigo: "5.86350.17.10", va: "VA001", valor: 782.570 }
 
-3. REFERÊNCIA — linha indentada, só com um número e um valor.
-        020045813           €391,280
+3. REFERENCIA - linha indentada, só com um número e um valor.
+        020045813           391,280
    Pertence ao circuito imediatamente ACIMA.
 
-FRONTEIRAS DE PÁGINA
+FRONTEIRAS DE PAGINA
 Se a página começar com referências ANTES do primeiro código VA, essas
 referências vêm da página anterior: coloca-as em "referenciasOrfas".
 Se a página começar logo com um código VA, referenciasOrfas é [].
 
-NÚMEROS
+NUMEROS
 Notação portuguesa para número JSON:
-  13.492,951 -> 13492.951    782,570 -> 782.570    €0,000 -> 0
+  13.492,951 -> 13492.951    782,570 -> 782.570    0,000 -> 0
 
 REGRAS
 Copia os dígitos EXATAMENTE como estão no texto. Não corrijas, não
@@ -74,7 +58,7 @@ Se tipoPagina for "movimentos" ou "outro", devolve arrays vazios.`,
 };
 
 // =====================================================================
-// SCHEMA DE SAÍDA DO MODELO
+// SCHEMA
 // =====================================================================
 
 const REFERENCIA_SCHEMA = {
@@ -127,7 +111,7 @@ const PAGE_SCHEMA = {
 };
 
 // =====================================================================
-// VALIDAÇÃO
+// VALIDACAO
 // =====================================================================
 
 const RE_CODIGO = /^5\.86350(?:\.\d+)+$/;
@@ -137,35 +121,28 @@ const RE_REFERENCIA = /^\d{6,12}$/;
 const num = (v) => (typeof v === "number" && Number.isFinite(v) ? v : null);
 const str = (v) => (typeof v === "string" && v.trim() ? v.trim() : null);
 
-// VA01 e VA001 são o mesmo circuito.
 const normalizarVA = (v) =>
   String(v ?? "").trim().toUpperCase()
     .replace(/^VA0*(\d+)$/, (_, n) => "VA" + n.padStart(3, "0"));
 
 function limparReferencias(lista) {
   const vistas = new Map();
-
   for (const item of Array.isArray(lista) ? lista : []) {
     const referencia = String(item?.referencia ?? "").trim();
     if (!RE_REFERENCIA.test(referencia)) continue;
-
     const valor = num(item?.valor);
     const anterior = vistas.get(referencia);
-
     if (!anterior) vistas.set(referencia, { referencia, valor });
     else if (anterior.valor === null && valor !== null) anterior.valor = valor;
   }
-
   return [...vistas.values()];
 }
 
 function limparCircuitos(lista) {
   const agrupados = new Map();
-
   for (const item of Array.isArray(lista) ? lista : []) {
     const codigo = String(item?.codigo ?? "").trim();
     const va = normalizarVA(item?.va);
-
     if (!RE_CODIGO.test(codigo) || !RE_VA.test(va)) continue;
 
     const chave = `${codigo}|${va}`;
@@ -180,14 +157,12 @@ function limparCircuitos(lista) {
       });
       continue;
     }
-
     if (existente.valor === null) existente.valor = num(item?.valor);
     existente.referencias = limparReferencias([
       ...existente.referencias,
       ...limparReferencias(item?.referencias),
     ]);
   }
-
   return [...agrupados.values()];
 }
 
@@ -208,19 +183,15 @@ function normalizarPagina(dados) {
 }
 
 // =====================================================================
-// ENTRADA DE FICHEIRO — aceita bytes crus ou base64
+// ENTRADA — aceita bytes crus ou base64
 // =====================================================================
 
 function paraBytes(buffer) {
   const bytes = new Uint8Array(buffer);
-
-  // %PDF- => já são bytes crus
   const ehPDF =
     bytes[0] === 0x25 && bytes[1] === 0x50 && bytes[2] === 0x44 && bytes[3] === 0x46;
-
   if (ehPDF) return bytes;
 
-  // Caso contrário assume base64 em texto (com ou sem prefixo data: e aspas)
   const texto = new TextDecoder()
     .decode(bytes)
     .replace(/^"|"$/g, "")
@@ -230,12 +201,11 @@ function paraBytes(buffer) {
   const binario = atob(texto);
   const saida = new Uint8Array(binario.length);
   for (let i = 0; i < binario.length; i++) saida[i] = binario.charCodeAt(i);
-
   return saida;
 }
 
 // =====================================================================
-// UTILITÁRIOS
+// UTILITARIOS
 // =====================================================================
 
 function resolverDocumento(tipoPedido, nomeFicheiro) {
@@ -259,14 +229,13 @@ function lerRespostaAI(resultado) {
   const inicio = texto.indexOf("{");
   const fim = texto.lastIndexOf("}");
   if (inicio >= 0 && fim > inicio) texto = texto.slice(inicio, fim + 1);
-
   return JSON.parse(texto);
 }
 
 const json = (corpo, status = 200) => Response.json(corpo, { status });
 
 // =====================================================================
-// CONSOLIDAÇÃO
+// CONSOLIDACAO
 // =====================================================================
 
 function consolidar(paginas) {
@@ -305,7 +274,6 @@ function consolidar(paginas) {
         circuitos.push(circuito);
         continue;
       }
-
       if (existente.valor === null) existente.valor = circuito.valor;
       existente.referencias = limparReferencias([
         ...existente.referencias,
@@ -314,7 +282,6 @@ function consolidar(paginas) {
     }
   }
 
-  // O total das páginas de circuitos é o valor SEM IVA — é com esse que a soma bate.
   const totalSemIVA = ordenadas
     .map((p) => p?.data ?? p)
     .find((d) => d?.tipoPagina === "circuitos" && d?.totalFatura != null)?.totalFatura;
@@ -388,9 +355,9 @@ export default {
     }
 
     try {
-      // -------------------------------------------------------------
-      // /api/pdf-text  — PDF inteiro -> texto por página, sem AI
-      // -------------------------------------------------------------
+      // ---------------------------------------------------------
+      // /api/pdf-text
+      // ---------------------------------------------------------
       if (url.pathname === "/api/pdf-text") {
         const nomeFicheiro = request.headers.get("x-file-name") || "fatura.pdf";
         const documento = resolverDocumento(request.headers.get("x-document-type"), nomeFicheiro);
@@ -416,30 +383,27 @@ export default {
           documentType: documento?.tipo ?? null,
           totalPaginas: paginas.length,
           totalCaracteres,
-          // Se isto for false, o PDF é digitalizado e não tem camada de texto.
           temCamadaTexto: totalCaracteres > 100,
           paginasComCircuitos: paginas.filter((p) => p.temCircuitos).map((p) => p.pageNumber),
           paginas,
         });
       }
 
-      // -------------------------------------------------------------
+      // ---------------------------------------------------------
       // /api/consolidate
-      // -------------------------------------------------------------
+      // ---------------------------------------------------------
       if (url.pathname === "/api/consolidate") {
         const corpo = await request.json();
         const paginas = Array.isArray(corpo) ? corpo : corpo?.paginas;
-
         if (!Array.isArray(paginas)) {
           return json({ success: false, error: "Esperado um array de páginas." }, 400);
         }
-
         return json({ success: true, ...consolidar(paginas) });
       }
 
-      // -------------------------------------------------------------
-      // /api/extract  — texto de 1 página -> JSON
-      // -------------------------------------------------------------
+      // ---------------------------------------------------------
+      // /api/extract
+      // ---------------------------------------------------------
       if (url.pathname !== "/api/extract") {
         return json({ error: "Not found", path: url.pathname }, 404);
       }
@@ -469,7 +433,7 @@ export default {
       const resultado = await env.AI.run(modelo, {
         messages: [
           { role: "system", content: documento.config.prompt },
-          { role: "user", content: `TEXTO DA PÁGINA:\n\n${texto}` },
+          { role: "user", content: `TEXTO DA PAGINA:\n\n${texto}` },
         ],
         temperature: 0,
         max_tokens: 6000,
