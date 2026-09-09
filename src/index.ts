@@ -367,10 +367,14 @@ export default {
         if (!bytes.byteLength) return json({ success: false, error: "PDF vazio." }, 400);
 
         const pdf = await getDocumentProxy(bytes);
-        const { text } = await extractText(pdf, { mergePages: false });
+        const de = Number(request.headers.get("x-page-from")) || 1;
+        const ate = Number(request.headers.get("x-page-to")) || 0;
 
-        const paginas = text.map((texto, i) => ({
-          pageNumber: i + 1,
+        const { text } = await extractText(pdf, { mergePages: false });
+        const fatia = ate > 0 ? text.slice(de - 1, ate) : text;
+
+        const paginas = fatia.map((texto, i) => ({
+          pageNumber: de + i,
           caracteres: texto.length,
           temCircuitos: filtro ? filtro.test(texto) : true,
           texto,
