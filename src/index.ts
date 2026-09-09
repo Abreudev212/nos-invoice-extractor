@@ -41,11 +41,32 @@ Três tipos de linha:
         020045813           391,280
    Pertence ao circuito imediatamente ACIMA.
 
-FRONTEIRAS DE PAGINA
-Se a página começar com referências ANTES do primeiro código VA, essas
-referências vêm da página anterior: coloca-as em "referenciasOrfas".
-Se a página começar logo com um código VA, referenciasOrfas é [].
+PRIMEIRO PASSO OBRIGATORIO — LINHAS ORFAS
 
+Antes de extraires qualquer circuito, percorre o texto de cima para baixo
+e localiza a PRIMEIRA linha que contenha um código VA.
+
+Todas as linhas de referência que apareçam ANTES dessa linha pertencem a um
+circuito de uma página anterior. Coloca-as em "referenciasOrfas" e NUNCA no
+array "referencias" do primeiro circuito.
+
+Exemplo desta situação:
+
+  500087098 €5,540 €5,540          <- ORFA
+  930512172 €0,000                 <- ORFA
+  5.86350.17.14 (VA011) €140,020   <- primeiro circuito
+  500086961 €134,480               <- referência do VA011
+  500087129 €5,540                 <- referência do VA011
+  932314889 €0,000                 <- referência do VA011
+
+Resultado correto:
+  referenciasOrfas: [500087098, 930512172]
+  VA011.referencias: [500086961, 500087129, 932314889]
+
+Resultado ERRADO (nunca faças isto):
+  VA011.referencias: [500087098, 930512172, ...]
+
+Só se o texto começar logo com um código VA é que referenciasOrfas fica [].
 NUMEROS
 Notação portuguesa para número JSON:
   13.492,951 -> 13492.951    782,570 -> 782.570    0,000 -> 0
