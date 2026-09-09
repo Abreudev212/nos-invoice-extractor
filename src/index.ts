@@ -50,41 +50,47 @@ Três tipos de linha:
 3. REFERENCIA - linha indentada, só com um número e um valor.
         020045813           391,280
    Pertence ao circuito imediatamente ACIMA.
+   ATENCAO: algumas linhas de referência têm apenas UM valor, tipicamente €0,000:
+    
+      932314889 €0,000
+    
+    Estas linhas SÃO referências válidas e têm de ser incluídas com valor 0.
+    Nunca as ignores por terem um só valor.
 
-PRIMEIRO PASSO OBRIGATORIO — LINHAS ORFAS
-
-Antes de extraires qualquer circuito, percorre o texto de cima para baixo
-e localiza a PRIMEIRA linha que contenha um código VA.
-
-Todas as linhas de referência que apareçam ANTES dessa linha pertencem a um
-circuito de uma página anterior. Coloca-as em "referenciasOrfas" e NUNCA no
-array "referencias" do primeiro circuito.
-
-Exemplo desta situação:
-
-  500087098 €5,540 €5,540          <- ORFA
-  930512172 €0,000                 <- ORFA
-  5.86350.17.14 (VA011) €140,020   <- primeiro circuito
-  500086961 €134,480               <- referência do VA011
-  500087129 €5,540                 <- referência do VA011
-  932314889 €0,000                 <- referência do VA011
-
-Resultado correto:
-  referenciasOrfas: [500087098, 930512172]
-  VA011.referencias: [500086961, 500087129, 932314889]
-
-Resultado ERRADO (nunca faças isto):
-  VA011.referencias: [500087098, 930512172, ...]
-
-Só se o texto começar logo com um código VA é que referenciasOrfas fica [].
-NUMEROS
-Notação portuguesa para número JSON:
-  13.492,951 -> 13492.951    782,570 -> 782.570    0,000 -> 0
-
-REGRAS
-Copia os dígitos EXATAMENTE como estão no texto. Não corrijas, não
-completes, não calcules, não somas, não inventes códigos VA.
-Se tipoPagina for "movimentos" ou "outro", devolve arrays vazios.`,
+    PRIMEIRO PASSO OBRIGATORIO — LINHAS ORFAS
+    
+    Antes de extraires qualquer circuito, percorre o texto de cima para baixo
+    e localiza a PRIMEIRA linha que contenha um código VA.
+    
+    Todas as linhas de referência que apareçam ANTES dessa linha pertencem a um
+    circuito de uma página anterior. Coloca-as em "referenciasOrfas" e NUNCA no
+    array "referencias" do primeiro circuito.
+    
+    Exemplo desta situação:
+    
+      500087098 €5,540 €5,540          <- ORFA
+      930512172 €0,000                 <- ORFA
+      5.86350.17.14 (VA011) €140,020   <- primeiro circuito
+      500086961 €134,480               <- referência do VA011
+      500087129 €5,540                 <- referência do VA011
+      932314889 €0,000                 <- referência do VA011
+    
+    Resultado correto:
+      referenciasOrfas: [500087098, 930512172]
+      VA011.referencias: [500086961, 500087129, 932314889]
+    
+    Resultado ERRADO (nunca faças isto):
+      VA011.referencias: [500087098, 930512172, ...]
+    
+    Só se o texto começar logo com um código VA é que referenciasOrfas fica [].
+    NUMEROS
+    Notação portuguesa para número JSON:
+      13.492,951 -> 13492.951    782,570 -> 782.570    0,000 -> 0
+    
+    REGRAS
+    Copia os dígitos EXATAMENTE como estão no texto. Não corrijas, não
+    completes, não calcules, não somas, não inventes códigos VA.
+    Se tipoPagina for "movimentos" ou "outro", devolve arrays vazios.`,
   },
 };
 
@@ -149,7 +155,17 @@ const RE_CODIGO = /^5\.86350(?:\.\d+)+$/;
 const RE_VA = /^VA\d+$/;
 const RE_REFERENCIA = /^\d{6,12}$/;
 
-const num = (v) => (typeof v === "number" && Number.isFinite(v) ? v : null);
+const num = (v) => {
+  if (typeof v !== "number" || !Number.isFinite(v)) return null;
+
+  // O modelo por vezes devolve 14002 em vez de 140.02 (perde a vírgula
+  // decimal da notação portuguesa). Os valores desta fatura têm sempre
+  // 3 casas decimais, por isso qualquer inteiro sem decimais e >= 1000
+  // é quase de certeza um valor a dividir por 100.
+  if (Number.isInteger(v) && Math.abs(v) >= 1000) return v / 100;
+
+  return v;
+};
 const str = (v) => (typeof v === "string" && v.trim() ? v.trim() : null);
 
 const normalizarVA = (v) =>
