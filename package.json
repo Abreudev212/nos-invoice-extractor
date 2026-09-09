@@ -16,6 +16,9 @@
 		"preview_image_url": "https://imagedelivery.net/wSMYJvS3Xw-n339CbDyDIA/65dd8441-89d3-491d-c5a1-0a000d070700/preview",
 		"publish": true
 	},
+	"dependencies": {
+		"unpdf": "latest"
+	},
 	"devDependencies": {
 		"@cloudflare/vitest-pool-workers": "0.21.3",
 		"@cloudflare/workers-types": "^4.20260702.1",
