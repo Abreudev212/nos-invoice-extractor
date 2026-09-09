@@ -213,7 +213,7 @@ function normalizarPagina(dados) {
     dataFatura: str(dados?.dataFatura),
     periodoFaturacao: str(dados?.periodoFaturacao),
     totalFatura: num(dados?.totalFatura),
-    circuitos: semCircuitos ? [] : limparCircuitos(dados?.circuitos),
+    circuitos: semCircuitos ? [] : candidatos,
     referenciasOrfas: semCircuitos ? [] : limparReferencias(dados?.referenciasOrfas),
   };
 }
