@@ -1,0 +1,19 @@
+name: gerar lock
+on: workflow_dispatch
+jobs:
+  lock:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm install --package-lock-only
+      - run: |
+          git config user.name github-actions
+          git config user.email actions@github.com
+          git add package-lock.json
+          git commit -m "gerar package-lock" || echo "sem alterações"
+          git push
