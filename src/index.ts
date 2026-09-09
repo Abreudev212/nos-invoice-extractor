@@ -90,6 +90,19 @@ estar no fim.
       NUMEROS
       Notação portuguesa para número JSON:
         13.492,951 -> 13492.951    782,570 -> 782.570    0,000 -> 0
+
+      A ULTIMA linha de referência da página aparece imediatamente antes de
+      "5.86350 (Conta principal) continua na próxima página". Essa linha É uma
+      referência válida e pertence ao último circuito da página.
+      
+      Exemplo do fim desta página:
+      
+        5.86350.17.22 (VA023) €140,020 €140,020
+        500086969 €134,480 €134,480
+        5.86350 (Conta principal) continua na próxima página »
+      
+      Correto:  VA023.referencias = [500086969]
+      ERRADO:   VA023.referencias = []
       
       REGRAS
       Copia os dígitos EXATAMENTE como estão no texto. Não corrijas, não
