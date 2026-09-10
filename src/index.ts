@@ -517,6 +517,13 @@ function consolidar(entradas) {
       circuitosSemLinhas: semLinhas,
       vasRepetidos,
       circuitosComSomaDivergente: divergencias,
+            // O total da fatura inclui grupos sem VA (ex.: GEST SERV), por isso
+      // os circuitos somam menos. O que tem de bater é cada circuito
+      // contra as suas linhas.
+      naoAtribuido:
+        cabecalho.totalFatura === null
+          ? null
+          : arr(cabecalho.totalFatura - somaCircuitos),
       fiavel:
         falhadas.length === 0 &&
         duplicadas.length === 0 &&
@@ -524,8 +531,8 @@ function consolidar(entradas) {
         saida.length > 0 &&
         cabecalho.numeroFatura !== null &&
         cabecalho.totalFatura !== null &&
-        Math.abs(somaCircuitos - cabecalho.totalFatura) <= 0.01 &&
-        divergencias.length === 0,
+        divergencias.length === 0 &&
+        somaCircuitos <= cabecalho.totalFatura + 0.01,
     },
   };
 }
