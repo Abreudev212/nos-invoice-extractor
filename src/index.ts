@@ -139,7 +139,13 @@ function valorPT(s) {
 // Só se aplica quando não há verificação pelo texto a corrigir o valor.
 function num(v) {
   if (typeof v !== "number" || !Number.isFinite(v)) return null;
+  // 14002 -> 140.02 (o modelo comeu a vírgula decimal)
   if (Number.isInteger(v) && Math.abs(v) >= 1000) return v / 100;
+  // 17.94691 -> 17946.91 (tratou o ponto de milhares como decimal)
+  if (!Number.isInteger(v) && Math.abs(v) < 100) {
+    const casas = (String(v).split(".")[1] ?? "").length;
+    if (casas >= 4) return v * 1000;
+  }
   return v;
 }
 
@@ -244,7 +250,7 @@ function lerEstruturaDoTexto(texto, regras) {
     if (r) {
       const ref = { referencia: r[1], valor: valorPT(r[2]) };
       if (atual) atual.referencias.push(ref);
-      else orfas.push(ref);
+      else if (!circuitos.length) orfas.push(ref);   // só antes do 1.º VA
     }
   }
 
